@@ -168,6 +168,8 @@ typedef struct driver_data {
 
 #define ERTS_SYS_READ_BUF_SZ (64*1024)
 
+#define ERTS_SPAWN_DRV_CONTROL_FORKER_SIGNAL 0x04c76a00U
+
 /* I. Initialization */
 
 void
@@ -763,28 +765,72 @@ static ErlDrvData spawn_start(ErlDrvPort port_num, char* name,
 #undef CMD_LINE_PREFIX_STR_SZ
 }
 
+static void clear_fd_data(ErtsSysFdData *fdd)
+{
+    if (fdd->sz > 0) {
+	erts_free(ERTS_ALC_T_FD_ENTRY_BUF, (void *) fdd->buf);
+	ASSERT(erts_atomic_read_nob(&sys_misc_mem_sz) >= fdd->sz);
+	erts_atomic_add_nob(&sys_misc_mem_sz, -1*fdd->sz);
+    }
+    fdd->buf = NULL;
+    fdd->sz = 0;
+    fdd->remain = 0;
+    fdd->cpos = NULL;
+    fdd->psz = 0;
+}
+
+static void nbio_stop_fd(ErlDrvPort prt, ErtsSysFdData *fdd, int use)
+{
+    clear_fd_data(fdd);
+    SET_BLOCKING(abs(fdd->fd));
+}
+
 static ErlDrvSSizeT spawn_control(ErlDrvData e, unsigned int cmd, char *buf,
                                   ErlDrvSizeT len, char **rbuf, ErlDrvSizeT rlen)
 {
     ErtsSysDriverData *dd = (ErtsSysDriverData*)e;
-    ErtsSysForkerProto *proto = (ErtsSysForkerProto *)buf;
+    ErtsSysForkerProto *proto;
 
-    if (cmd != ERTS_SPAWN_DRV_CONTROL_MAGIC_NUMBER)
+    switch(cmd) {
+      case ERTS_SPAWN_DRV_CONTROL_CLOSE_INPUT:
+		if(dd->ifd) {
+			driver_select(dd->port_num, abs(dd->ifd->fd), ERL_DRV_READ | ERL_DRV_USE, 0);
+			nbio_stop_fd(dd->port_num, dd->ifd, 1);
+			erts_atomic_add_nob(&sys_misc_mem_sz, -sizeof(ErtsSysFdData));
+			dd->ifd = NULL;
+			return 0;
+        } else {
+           return -1;
+        }
+      case ERTS_SPAWN_DRV_CONTROL_CLOSE_OUTPUT:
+		if(dd->ofd) {
+			driver_select(dd->port_num, abs(dd->ofd->fd), ERL_DRV_READ | ERL_DRV_USE, 0);
+			nbio_stop_fd(dd->port_num, dd->ofd, 1);
+			erts_atomic_add_nob(&sys_misc_mem_sz, -sizeof(ErtsSysFdData));
+			dd->ofd = NULL;
+			return 0;
+        } else {
+           return -1;
+        }
+     case ERTS_SPAWN_DRV_CONTROL_FORKER_SIGNAL:;
+	    proto = (ErtsSysForkerProto *)buf;
+
+	    ASSERT(len == sizeof(*proto));
+	    ASSERT(proto->action == ErtsSysForkerProtoAction_SigChld);
+
+	    dd->status = proto->u.sigchld.error_number;
+	    dd->alive = -1;
+
+	    if (dd->ifd)
+	        driver_select(dd->port_num, abs(dd->ifd->fd), ERL_DRV_READ | ERL_DRV_USE, 1);
+
+	    if (dd->ofd)
+	        driver_select(dd->port_num, abs(dd->ofd->fd), ERL_DRV_WRITE | ERL_DRV_USE, 1);
+
+	    return 0;
+      default:
         return -1;
-
-    ASSERT(len == sizeof(*proto));
-    ASSERT(proto->action == ErtsSysForkerProtoAction_SigChld);
-
-    dd->status = proto->u.sigchld.error_number;
-    dd->alive = -1;
-
-    if (dd->ifd)
-        driver_select(dd->port_num, abs(dd->ifd->fd), ERL_DRV_READ | ERL_DRV_USE, 1);
-
-    if (dd->ofd)
-        driver_select(dd->port_num, abs(dd->ofd->fd), ERL_DRV_WRITE | ERL_DRV_USE, 1);
-
-    return 0;
+    }
 }
 
 #define FD_DEF_HEIGHT 24
@@ -1010,27 +1056,6 @@ static ErlDrvData fd_start(ErlDrvPort port_num, char* name,
                                           opts->read_write, 0, -1,
                                           !non_blocking, opts);
 }
-
-static void clear_fd_data(ErtsSysFdData *fdd)
-{
-    if (fdd->sz > 0) {
-	erts_free(ERTS_ALC_T_FD_ENTRY_BUF, (void *) fdd->buf);
-	ASSERT(erts_atomic_read_nob(&sys_misc_mem_sz) >= fdd->sz);
-	erts_atomic_add_nob(&sys_misc_mem_sz, -1*fdd->sz);
-    }
-    fdd->buf = NULL;
-    fdd->sz = 0;
-    fdd->remain = 0;
-    fdd->cpos = NULL;
-    fdd->psz = 0;
-}
-
-static void nbio_stop_fd(ErlDrvPort prt, ErtsSysFdData *fdd, int use)
-{
-    clear_fd_data(fdd);
-    SET_BLOCKING(abs(fdd->fd));
-}
-
 static void fd_stop(ErlDrvData ev)  /* Does not close the fds */
 {
     ErtsSysDriverData* dd = (ErtsSysDriverData*)ev;
@@ -1755,7 +1780,7 @@ static void forker_sigchld(Eterm port_id, int error)
        already used by the spawn_driver, we use control instead.
        Note that when using erl_drv_port_control it is an asynchronous
        control. */
-    erl_drv_port_control(port_id, ERTS_SPAWN_DRV_CONTROL_MAGIC_NUMBER,
+    erl_drv_port_control(port_id, ERTS_SPAWN_DRV_CONTROL_FORKER_SIGNAL,
                          (char*)proto, sizeof(*proto));
 }
 
